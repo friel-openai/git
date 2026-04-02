@@ -10,7 +10,8 @@ SYNOPSIS
 --------
 [verse]
 'git http-fetch' [-c] [-t] [-a] [-d] [-v] [-w <filename>] [--recover]
-		 [--stdout] [--stdin | --packfile=<hash> | <commit>] <URL>
+		 [--download-only | --stdout]
+		 [--stdin | --packfile=<hash> | <commit>] <URL>
 
 DESCRIPTION
 -----------
@@ -48,11 +49,17 @@ commit-id::
 	For internal use only. Instead of a commit id on the command
 	line (which is not expected in
 	this case), 'git http-fetch' fetches the packfile directly at the given
-	URL and uses index-pack to generate corresponding .idx and .keep files.
-	The hash is used to determine the name of the temporary file and is
-	arbitrary. The output of index-pack is printed to stdout unless
-	`--stdout` is given. Requires `--index-pack-args` unless `--stdout`
-	is given.
+	URL and uses index-pack to generate corresponding .idx and .keep files,
+	unless `--download-only` or `--stdout` is given. The hash is used to
+	determine the name of the temporary file and is arbitrary. The output
+	of index-pack is printed to stdout unless `--download-only` or
+	`--stdout` is given. Requires `--index-pack-args` unless
+	`--download-only` or `--stdout` is given.
+
+--download-only::
+	For internal use only, and only valid with `--packfile=<hash>`.
+	Download the packfile to a temporary file and write the temporary
+	file's path to standard output instead of running `index-pack`.
 
 --stdout::
 	For internal use only, and only valid with `--packfile=<hash>`.

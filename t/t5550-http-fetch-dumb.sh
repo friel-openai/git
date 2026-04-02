@@ -313,6 +313,31 @@ test_expect_success 'http-fetch --packfile --stdout' '
 	git -C packfileclient-stdout cat-file -e "$HASH"
 '
 
+test_expect_success 'http-fetch --packfile --download-only' '
+	ARBITRARY=$(git -C "$HTTPD_DOCUMENT_ROOT_PATH"/repo_pack.git rev-parse HEAD) &&
+
+	git init packfileclient-download-only &&
+	p=$(cd "$HTTPD_DOCUMENT_ROOT_PATH"/repo_pack.git && ls objects/pack/pack-*.pack) &&
+	git -C packfileclient-download-only http-fetch --packfile=$ARBITRARY \
+		--download-only "$HTTPD_URL"/dumb/repo_pack.git/$p >tmpfile-path &&
+	pack_tmp=packfileclient-download-only/$(cat tmpfile-path) &&
+	test_path_is_file "$pack_tmp" &&
+
+	git -C packfileclient-download-only index-pack --stdin --keep \
+		--report-packfile-uri-stats <"$pack_tmp" >out &&
+	grep -E "^keep.[0-9a-f]{16,}$" out &&
+	grep -E "^packfile-uris.[0-9]+.[0-9]+$" out &&
+	cut -c6- out | sed -n 1p >packhash &&
+
+	test_path_is_file "packfileclient-download-only/.git/objects/pack/pack-$(cat packhash).pack" &&
+	test_path_is_file "packfileclient-download-only/.git/objects/pack/pack-$(cat packhash).idx" &&
+	test_path_is_file "packfileclient-download-only/.git/objects/pack/pack-$(cat packhash).keep" &&
+
+	HASH=$(git -C "$HTTPD_DOCUMENT_ROOT_PATH"/repo_pack.git rev-parse HEAD) &&
+	git -C packfileclient-download-only cat-file -e "$HASH" &&
+	rm -f "$pack_tmp"
+'
+
 test_expect_success 'fetch notices corrupt pack' '
 	cp -R "$HTTPD_DOCUMENT_ROOT_PATH"/repo_pack.git "$HTTPD_DOCUMENT_ROOT_PATH"/repo_bad1.git &&
 	(cd "$HTTPD_DOCUMENT_ROOT_PATH"/repo_bad1.git &&
