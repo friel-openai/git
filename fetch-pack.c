@@ -1735,6 +1735,13 @@ struct packfile_uri_progress {
 	int enabled;
 };
 
+static int packfile_uri_stderr_is_foreground(void)
+{
+	int tpgrp = tcgetpgrp(2);
+
+	return tpgrp < 0 || tpgrp == getpgid(0);
+}
+
 static void start_packfile_uri_progress(struct packfile_uri_progress *progress,
 					size_t nr_packs_total,
 					int enabled)
@@ -1756,6 +1763,8 @@ static void display_packfile_uri_progress(struct packfile_uri_progress *progress
 	size_t line_len;
 
 	if (!progress->enabled)
+		return;
+	if (!done && !packfile_uri_stderr_is_foreground())
 		return;
 
 	elapsed_ns = getnanotime() - progress->start_ns;
