@@ -19,6 +19,7 @@
 #include "remote.h"
 #include "run-command.h"
 #include "connect.h"
+#include "trace.h"
 #include "trace2.h"
 #include "version.h"
 #include "oid-array.h"
@@ -37,6 +38,7 @@
 #include "compat/nonblock.h"
 #include "mergesort.h"
 #include "prio-queue.h"
+#include "progress.h"
 #include "promisor-remote.h"
 
 static int transfer_unpack_limit = -1;
@@ -1628,19 +1630,27 @@ static void receive_packfile_uris(struct packet_reader *reader,
 		die("expected DELIM");
 }
 
-struct packfile_uri_child {
+struct packfile_uri_download {
+	struct child_process cmd;
 	const char *uri_line;
-	int out;
+	char *packfile;
+	int in_use;
 	struct strbuf output;
 };
 
-struct packfile_uri_state {
-	struct string_list *packfile_uris;
-	const struct strvec *index_pack_args;
-	struct string_list *pack_lockfiles;
-	struct oidset *gitmodules_oids;
-	size_t next;
-	int result;
+struct packfile_uri_index {
+	struct child_process cmd;
+	const char *uri_line;
+	char *packfile;
+	int in_use;
+	uintmax_t nr_objects;
+	uintmax_t nr_deltas;
+	struct strbuf output;
+};
+
+struct packfile_uri_item {
+	const char *uri_line;
+	char *packfile;
 };
 
 static size_t packfile_uri_parallel_processes(size_t nr)
@@ -1675,6 +1685,24 @@ static size_t packfile_uri_parallel_processes(size_t nr)
 	return processes;
 }
 
+static size_t packfile_uri_download_processes(size_t nr)
+{
+	int uri_jobs = 0;
+
+	if (nr <= 1)
+		return 1;
+
+	repo_config_get_int(the_repository, "fetch.packfileurijobs", &uri_jobs);
+	if (uri_jobs < 0)
+		die(_("invalid number of packfile URI jobs specified (%d)"),
+		    uri_jobs);
+	if (!uri_jobs)
+		uri_jobs = 8;
+	if ((size_t)uri_jobs > nr)
+		uri_jobs = nr;
+	return uri_jobs;
+}
+
 static int packfile_uri_args_include_shallow_file(const struct strvec *index_pack_args)
 {
 	size_t i;
@@ -1685,99 +1713,206 @@ static int packfile_uri_args_include_shallow_file(const struct strvec *index_pac
 	return 0;
 }
 
-static int start_packfile_uri_child(struct child_process *cmd,
-				    struct strbuf *out UNUSED,
-				    void *pp_cb,
-				    void **pp_task_cb)
+static int packfile_uri_args_include_verbose(const struct strvec *index_pack_args)
 {
-	struct packfile_uri_state *state = pp_cb;
-	struct packfile_uri_child *child;
-	int pipe_fd[2];
-	size_t j;
-	const char *uri;
+	size_t i;
 
-	if (state->next >= state->packfile_uris->nr)
-		return 0;
-
-	if (pipe(pipe_fd) < 0)
-		die_errno("pipe");
-	if (enable_pipe_nonblock(pipe_fd[0]) < 0)
-		die_errno("enable_pipe_nonblock");
-
-	child = xcalloc(1, sizeof(*child));
-	child->uri_line = state->packfile_uris->items[state->next++].string;
-	child->out = pipe_fd[0];
-	strbuf_init(&child->output, 0);
-	uri = child->uri_line + the_hash_algo->hexsz + 1;
-
-	strvec_push(&cmd->args, "http-fetch");
-	strvec_pushf(&cmd->args, "--packfile=%.*s",
-		     (int)the_hash_algo->hexsz, child->uri_line);
-	for (j = 0; j < state->index_pack_args->nr; j++)
-		strvec_pushf(&cmd->args, "--index-pack-arg=%s",
-			     state->index_pack_args->v[j]);
-	strvec_push(&cmd->args, "--index-pack-arg=--threads=1");
-	strvec_push(&cmd->args, uri);
-	cmd->in = -1;
-	cmd->out = pipe_fd[1];
-	cmd->git_cmd = 1;
-	cmd->no_stdin = 0;
-
-	*pp_task_cb = child;
-	return 1;
-}
-
-static void packfile_uri_child_release(struct packfile_uri_child *child)
-{
-	if (!child)
-		return;
-	if (child->out >= 0)
-		close(child->out);
-	strbuf_release(&child->output);
-	free(child);
-}
-
-static int packfile_uri_child_start_failed(struct strbuf *out UNUSED,
-					   void *pp_cb,
-					   void *pp_task_cb)
-{
-	struct packfile_uri_state *state = pp_cb;
-	struct packfile_uri_child *child = pp_task_cb;
-
-	state->result = error("fetch-pack: unable to spawn http-fetch");
-	packfile_uri_child_release(child);
-	return -SIGTERM;
-}
-
-static int packfile_uri_child_feed_pipe(int child_in UNUSED,
-					void *pp_cb UNUSED,
-					void *pp_task_cb)
-{
-	struct packfile_uri_child *child = pp_task_cb;
-
-	for (;;) {
-		ssize_t n = strbuf_read_once(&child->output, child->out, 0);
-
-		if (n > 0)
-			continue;
-		if (!n) {
-			close(child->out);
-			child->out = -1;
+	for (i = 0; i < index_pack_args->nr; i++)
+		if (!strcmp(index_pack_args->v[i], "-v"))
 			return 1;
-		}
-		if (errno == EAGAIN || errno == EWOULDBLOCK)
-			return 0;
-		return -1;
-	}
+	return 0;
 }
 
-static int finish_packfile_uri_child(int result,
-				     struct strbuf *out UNUSED,
-				     void *pp_cb,
-				     void *pp_task_cb)
+struct packfile_uri_progress {
+	size_t nr_packs_total;
+	size_t nr_packs_downloaded;
+	size_t nr_packs_indexed;
+	uintmax_t nr_bytes_downloaded;
+	uintmax_t nr_objects;
+	uintmax_t nr_deltas;
+	uint64_t start_ns;
+	size_t last_len;
+	int enabled;
+};
+
+static void start_packfile_uri_progress(struct packfile_uri_progress *progress,
+					size_t nr_packs_total,
+					int enabled)
 {
-	struct packfile_uri_state *state = pp_cb;
-	struct packfile_uri_child *child = pp_task_cb;
+	memset(progress, 0, sizeof(*progress));
+	progress->nr_packs_total = nr_packs_total;
+	progress->start_ns = getnanotime();
+	progress->enabled = enabled && isatty(2);
+}
+
+static void display_packfile_uri_progress(struct packfile_uri_progress *progress,
+					  int done)
+{
+	struct strbuf sb = STRBUF_INIT;
+	struct strbuf bytes = STRBUF_INIT;
+	struct strbuf rate = STRBUF_INIT;
+	uint64_t elapsed_ns;
+	uint64_t rate_bytes = 0;
+	size_t line_len;
+
+	if (!progress->enabled)
+		return;
+
+	elapsed_ns = getnanotime() - progress->start_ns;
+	if (elapsed_ns)
+		rate_bytes = progress->nr_bytes_downloaded * 1000000000 /
+			elapsed_ns;
+
+	strbuf_humanise_bytes(&bytes, progress->nr_bytes_downloaded);
+	strbuf_humanise_bytes(&rate, rate_bytes);
+	strbuf_addf(&sb,
+		    "packfile URIs: %"PRIuMAX"/%"PRIuMAX" downloaded, "
+		    "%"PRIuMAX"/%"PRIuMAX" indexed, %"PRIuMAX" objects, "
+		    "%"PRIuMAX" deltas, %s | %s/s",
+		    (uintmax_t)progress->nr_packs_downloaded,
+		    (uintmax_t)progress->nr_packs_total,
+		    (uintmax_t)progress->nr_packs_indexed,
+		    (uintmax_t)progress->nr_packs_total,
+		    progress->nr_objects, progress->nr_deltas,
+		    bytes.buf, rate.buf);
+	if (done)
+		strbuf_addstr(&sb, ", done.");
+	line_len = sb.len;
+	if (progress->last_len > line_len)
+		strbuf_addchars(&sb, ' ', progress->last_len - line_len);
+	strbuf_addch(&sb, done ? '\n' : '\r');
+	fputs(sb.buf, stderr);
+	fflush(stderr);
+	progress->last_len = done ? 0 : line_len;
+	strbuf_release(&rate);
+	strbuf_release(&bytes);
+	strbuf_release(&sb);
+}
+
+static void start_packfile_uri_download(struct packfile_uri_download *child,
+					const char *uri_line)
+{
+	const char *uri = uri_line + the_hash_algo->hexsz + 1;
+
+	child_process_init(&child->cmd);
+	child->uri_line = uri_line;
+	child->in_use = 1;
+	strbuf_init(&child->output, 0);
+
+	strvec_push(&child->cmd.args, "http-fetch");
+	strvec_push(&child->cmd.args, "--download-only");
+	strvec_pushf(&child->cmd.args, "--packfile=%.*s",
+		     (int)the_hash_algo->hexsz, child->uri_line);
+	strvec_push(&child->cmd.args, uri);
+	child->cmd.git_cmd = 1;
+	child->cmd.no_stdin = 1;
+	child->cmd.out = -1;
+	if (start_command(&child->cmd))
+		die("fetch-pack: unable to spawn http-fetch");
+	if (enable_pipe_nonblock(child->cmd.out) < 0)
+		die_errno("enable_pipe_nonblock");
+}
+
+static void start_packfile_uri_index(struct packfile_uri_index *child,
+				     const char *uri_line,
+				     char *packfile,
+				     const struct strvec *index_pack_args,
+				     int suppress_progress)
+{
+	size_t j;
+	int packfile_fd = xopen(packfile, O_RDONLY);
+
+	child_process_init(&child->cmd);
+	child->uri_line = uri_line;
+	child->packfile = packfile;
+	child->in_use = 1;
+	child->nr_objects = 0;
+	child->nr_deltas = 0;
+	strbuf_init(&child->output, 0);
+
+	child->cmd.git_cmd = 1;
+	child->cmd.in = packfile_fd;
+	child->cmd.out = -1;
+	for (j = 0; j < index_pack_args->nr; j++)
+		if (!suppress_progress || strcmp(index_pack_args->v[j], "-v"))
+			strvec_push(&child->cmd.args, index_pack_args->v[j]);
+	strvec_push(&child->cmd.args, "--threads=1");
+	strvec_push(&child->cmd.args, "--report-packfile-uri-stats");
+	if (start_command(&child->cmd))
+		die("fetch-pack: unable to spawn index-pack");
+	child->cmd.in = 0;
+	if (enable_pipe_nonblock(child->cmd.out) < 0)
+		die_errno("enable_pipe_nonblock");
+}
+
+static void packfile_uri_download_release(struct packfile_uri_download *child)
+{
+	if (!child->in_use)
+		return;
+	if (child->cmd.out > 0)
+		close(child->cmd.out);
+	child_process_clear(&child->cmd);
+	free(child->packfile);
+	strbuf_release(&child->output);
+	child->uri_line = NULL;
+	child->packfile = NULL;
+	child->in_use = 0;
+}
+
+static void packfile_uri_index_release(struct packfile_uri_index *child)
+{
+	if (!child->in_use)
+		return;
+	if (child->cmd.in > 0)
+		close(child->cmd.in);
+	if (child->cmd.out > 0)
+		close(child->cmd.out);
+	child_process_clear(&child->cmd);
+	free(child->packfile);
+	strbuf_release(&child->output);
+	child->uri_line = NULL;
+	child->packfile = NULL;
+	child->in_use = 0;
+}
+
+static int read_packfile_uri_output(int fd, struct strbuf *output)
+{
+	ssize_t n = strbuf_read_once(output, fd, 0);
+
+	if (n > 0)
+		return 0;
+	if (!n)
+		return 1;
+	if (errno == EAGAIN || errno == EWOULDBLOCK)
+		return 0;
+	die_errno("read");
+}
+
+static struct packfile_uri_item finish_packfile_uri_download(
+	struct packfile_uri_download *child)
+{
+	struct packfile_uri_item item;
+
+	if (finish_command(&child->cmd))
+		die("fetch-pack: unable to finish http-fetch");
+
+	strbuf_trim_trailing_newline(&child->output);
+	if (!child->output.len)
+		die("fetch-pack: expected packfile path from http-fetch");
+
+	item.uri_line = child->uri_line;
+	item.packfile = strbuf_detach(&child->output, NULL);
+	strbuf_init(&child->output, 0);
+	child->uri_line = NULL;
+	packfile_uri_download_release(child);
+	return item;
+}
+
+static void finish_packfile_uri_index(struct packfile_uri_index *child,
+				      struct string_list *pack_lockfiles,
+				      struct oidset *gitmodules_oids,
+				      struct packfile_uri_progress *progress)
+{
 	const size_t prefix_len = 5;
 	const size_t hash_len = the_hash_algo->hexsz;
 	const size_t header_len = prefix_len + hash_len + 1;
@@ -1785,14 +1920,12 @@ static int finish_packfile_uri_child(int result,
 	const char *uri = child->uri_line + the_hash_algo->hexsz + 1;
 	const char *gitmodules_data;
 	size_t gitmodules_len;
-	int ret = 0;
-	size_t offset;
+	const char *line;
+	const char *eol;
 
-	if (result) {
-		state->result = error("fetch-pack: unable to finish http-fetch");
-		ret = -SIGTERM;
-		goto out;
-	}
+	if (finish_command(&child->cmd))
+		die("fetch-pack: unable to finish index-pack");
+	unlink(child->packfile);
 
 	if (child->output.len < header_len ||
 	    memcmp(child->output.buf, "keep\t", prefix_len) ||
@@ -1804,30 +1937,49 @@ static int finish_packfile_uri_child(int result,
 
 	gitmodules_data = child->output.buf + header_len;
 	gitmodules_len = child->output.len - header_len;
-	if (gitmodules_len % (hash_len + 1))
-		die("invalid length read %d", (int)gitmodules_len);
-	for (offset = 0; offset < gitmodules_len; offset += hash_len + 1) {
-		struct object_id oid;
-		const char *end;
+	line = gitmodules_data;
+	while (line < gitmodules_data + gitmodules_len) {
+		if (skip_prefix(line, "packfile-uris\t", &line)) {
+			char *end;
 
-		if (parse_oid_hex(gitmodules_data + offset, &oid, &end) ||
-		    *end != '\n')
+			child->nr_objects = strtoumax(line, &end, 10);
+			if (end == line || *end != '\t')
+				die("invalid packfile-uris object count");
+			line = end + 1;
+			child->nr_deltas = strtoumax(line, &end, 10);
+			if (end == line || *end != '\n')
+				die("invalid packfile-uris delta count");
+			line = end + 1;
+			continue;
+		}
+
+		eol = memchr(line, '\n', gitmodules_data + gitmodules_len - line);
+		if (!eol)
 			die("invalid hash");
-		oidset_insert(state->gitmodules_oids, &oid);
+		if (eol - line != hash_len)
+			die("invalid hash");
+		{
+			struct object_id oid;
+			const char *end;
+
+			if (parse_oid_hex(line, &oid, &end) || end != eol)
+				die("invalid hash");
+			oidset_insert(gitmodules_oids, &oid);
+		}
+		line = eol + 1;
 	}
 
 	if (memcmp(child->uri_line, packname, the_hash_algo->hexsz))
 		die("fetch-pack: pack downloaded from %s does not match expected hash %.*s",
 		    uri, (int)the_hash_algo->hexsz, child->uri_line);
 
-	string_list_append_nodup(state->pack_lockfiles,
+	string_list_append_nodup(pack_lockfiles,
 				 xstrfmt("%s/pack/pack-%s.keep",
 					 repo_get_object_directory(the_repository),
 					 packname));
-
-out:
-	packfile_uri_child_release(child);
-	return ret;
+	progress->nr_objects += child->nr_objects;
+	progress->nr_deltas += child->nr_deltas;
+	packfile_uri_index_release(child);
 }
 
 static void fetch_packfile_uris(struct string_list *packfile_uris,
@@ -1835,33 +1987,145 @@ static void fetch_packfile_uris(struct string_list *packfile_uris,
 				struct string_list *pack_lockfiles,
 				struct oidset *gitmodules_oids)
 {
-	size_t batch_size = packfile_uri_parallel_processes(packfile_uris->nr);
-	struct packfile_uri_state state = {
-		.packfile_uris = packfile_uris,
-		.index_pack_args = index_pack_args,
-		.pack_lockfiles = pack_lockfiles,
-		.gitmodules_oids = gitmodules_oids,
-	};
+	size_t nr_download_jobs = packfile_uri_download_processes(packfile_uris->nr);
+	size_t nr_index_jobs = packfile_uri_parallel_processes(packfile_uris->nr);
+	int suppress_progress = packfile_uri_args_include_verbose(index_pack_args);
+	struct packfile_uri_progress progress;
+	struct packfile_uri_download *downloads;
+	struct packfile_uri_index *indexers;
+	struct packfile_uri_item *ready = NULL;
+	size_t ready_nr = 0, ready_alloc = 0;
+	struct pollfd *pfd;
+	size_t next = 0;
+	size_t nr_downloading = 0;
+	size_t nr_indexing = 0;
+	size_t i;
 
 	if (!packfile_uris->nr)
 		return;
 
 	if (packfile_uri_args_include_shallow_file(index_pack_args))
-		batch_size = 1;
+		nr_index_jobs = 1;
 
-	run_processes_parallel(&(const struct run_process_parallel_opts){
-		.tr2_category = "fetch-pack",
-		.tr2_label = "parallel/packfile-uri",
-		.processes = batch_size,
-		.ungroup = 1,
-		.get_next_task = start_packfile_uri_child,
-		.start_failure = packfile_uri_child_start_failed,
-		.feed_pipe = packfile_uri_child_feed_pipe,
-		.task_finished = finish_packfile_uri_child,
-		.data = &state,
-	});
-	if (state.result)
-		die(_("git fetch-pack: fetch failed."));
+	trace2_region_enter_printf("fetch-pack", "parallel/packfile-uri",
+				   the_repository, "max:%"PRIuMAX,
+				   (uintmax_t)nr_download_jobs);
+
+	start_packfile_uri_progress(&progress, packfile_uris->nr,
+				    packfile_uri_args_include_verbose(index_pack_args));
+	if (suppress_progress)
+		display_packfile_uri_progress(&progress, 0);
+
+	CALLOC_ARRAY(downloads, nr_download_jobs);
+	CALLOC_ARRAY(indexers, nr_index_jobs);
+	CALLOC_ARRAY(pfd, nr_download_jobs + nr_index_jobs);
+
+	for (i = 0; i < nr_download_jobs && next < packfile_uris->nr; i++) {
+		start_packfile_uri_download(&downloads[i],
+					    packfile_uris->items[next++].string);
+		nr_downloading++;
+	}
+
+	while (nr_downloading || nr_indexing || ready_nr) {
+		int rc;
+
+		while (ready_nr && nr_indexing < nr_index_jobs) {
+			for (i = 0; i < nr_index_jobs; i++)
+				if (!indexers[i].in_use)
+					break;
+			if (i == nr_index_jobs)
+				BUG("no free packfile URI indexer");
+
+			start_packfile_uri_index(&indexers[i],
+						 ready[ready_nr - 1].uri_line,
+						 ready[ready_nr - 1].packfile,
+						 index_pack_args,
+						 suppress_progress);
+			ready_nr--;
+			nr_indexing++;
+		}
+
+		for (i = 0; i < nr_download_jobs; i++) {
+			pfd[i].fd = downloads[i].in_use && downloads[i].cmd.out > 0 ?
+				downloads[i].cmd.out : -1;
+			pfd[i].events = POLLIN | POLLHUP;
+			pfd[i].revents = 0;
+		}
+
+		for (i = 0; i < nr_index_jobs; i++) {
+			pfd[nr_download_jobs + i].fd = indexers[i].in_use &&
+				indexers[i].cmd.out > 0 ?
+				indexers[i].cmd.out : -1;
+			pfd[nr_download_jobs + i].events = POLLIN | POLLHUP;
+			pfd[nr_download_jobs + i].revents = 0;
+		}
+
+		rc = poll(pfd, nr_download_jobs + nr_index_jobs, -1);
+		if (rc < 0) {
+			if (errno == EINTR)
+				continue;
+			die_errno("poll");
+		}
+
+		for (i = 0; i < nr_download_jobs; i++) {
+			if (!downloads[i].in_use || pfd[i].fd < 0 ||
+			    !(pfd[i].revents & (POLLIN | POLLHUP)))
+				continue;
+
+			if (!read_packfile_uri_output(downloads[i].cmd.out,
+						      &downloads[i].output))
+				continue;
+
+			close(downloads[i].cmd.out);
+			downloads[i].cmd.out = 0;
+
+			ALLOC_GROW(ready, ready_nr + 1, ready_alloc);
+			ready[ready_nr++] = finish_packfile_uri_download(&downloads[i]);
+			nr_downloading--;
+			progress.nr_packs_downloaded++;
+			if (ready[ready_nr - 1].packfile) {
+				struct stat st;
+				if (!stat(ready[ready_nr - 1].packfile, &st))
+					progress.nr_bytes_downloaded += st.st_size;
+			}
+			display_packfile_uri_progress(&progress, 0);
+
+			if (next < packfile_uris->nr) {
+				start_packfile_uri_download(&downloads[i],
+							    packfile_uris->items[next++].string);
+				nr_downloading++;
+			}
+		}
+
+		for (i = 0; i < nr_index_jobs; i++) {
+			if (!indexers[i].in_use ||
+			    pfd[nr_download_jobs + i].fd < 0 ||
+			    !(pfd[nr_download_jobs + i].revents &
+			      (POLLIN | POLLHUP)))
+				continue;
+
+			if (!read_packfile_uri_output(indexers[i].cmd.out,
+						      &indexers[i].output))
+				continue;
+
+			close(indexers[i].cmd.out);
+			indexers[i].cmd.out = 0;
+
+			finish_packfile_uri_index(&indexers[i], pack_lockfiles,
+						  gitmodules_oids, &progress);
+			nr_indexing--;
+			progress.nr_packs_indexed++;
+			display_packfile_uri_progress(&progress, 0);
+		}
+	}
+
+	display_packfile_uri_progress(&progress, 1);
+	free(pfd);
+	free(downloads);
+	free(indexers);
+	free(ready);
+	trace2_region_leave("fetch-pack", "parallel/packfile-uri",
+			    the_repository);
 }
 
 enum fetch_state {

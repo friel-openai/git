@@ -214,6 +214,7 @@ struct http_pack_request {
 	 * If NULL, defaults to	{"index-pack", "--stdin", NULL}.
 	 */
 	const char **index_pack_args;
+	unsigned preserve_tmp_packfile : 1;
 	unsigned preserve_index_pack_stdout : 1;
 	unsigned stream_to_stdout : 1;
 

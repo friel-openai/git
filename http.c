@@ -2628,6 +2628,11 @@ int finish_http_pack_request(struct http_pack_request *preq)
 	fclose(preq->packfile);
 	preq->packfile = NULL;
 
+	if (preq->preserve_tmp_packfile) {
+		printf("%s\n", preq->tmpfile.buf);
+		return 0;
+	}
+
 	tmpfile_fd = xopen(preq->tmpfile.buf, O_RDONLY);
 
 	ip.git_cmd = 1;

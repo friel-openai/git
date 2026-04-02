@@ -142,6 +142,7 @@ static const char *progress_title;
 static int show_resolving_progress;
 static int show_stat;
 static int check_self_contained_and_connected;
+static int report_packfile_uri_stats;
 
 static struct progress *progress;
 
@@ -1976,6 +1977,8 @@ int cmd_index_pack(int argc,
 				show_resolving_progress = 1;
 			} else if (!strcmp(arg, "--report-end-of-input")) {
 				report_end_of_input = 1;
+			} else if (!strcmp(arg, "--report-packfile-uri-stats")) {
+				report_packfile_uri_stats = 1;
 			} else if (!strcmp(arg, "-o")) {
 				if (index_name || (i+1) >= argc)
 					usage(index_pack_usage);
@@ -2138,6 +2141,10 @@ int cmd_index_pack(int argc,
 	free(curr_rev_index);
 
 	repack_local_links();
+
+	if (report_packfile_uri_stats)
+		printf("packfile-uris\t%d\t%d\n", nr_objects,
+		       nr_resolved_deltas);
 
 	/*
 	 * Let the caller know this pack is not self contained

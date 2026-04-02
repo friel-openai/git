@@ -14,7 +14,7 @@
 #include "trace2.h"
 
 static const char http_fetch_usage[] = "git http-fetch "
-"[-c] [-t] [-a] [-v] [--recover] [-w ref] [--stdout] [--stdin | --packfile=hash | commit-id] url";
+"[-c] [-t] [-a] [-v] [--recover] [-w ref] [--download-only | --stdout] [--stdin | --packfile=hash | commit-id] url";
 
 static int fetch_using_walker(const char *raw_url, int get_verbosely,
 			      int get_recover, int commits, char **commit_id,
@@ -55,6 +55,7 @@ static int fetch_using_walker(const char *raw_url, int get_verbosely,
 static void fetch_single_packfile(struct object_id *packfile_hash,
 				  const char *url,
 				  const char **index_pack_args,
+				  int packfile_download_only,
 				  int packfile_to_stdout)
 {
 	struct http_pack_request *preq;
@@ -72,6 +73,8 @@ static void fetch_single_packfile(struct object_id *packfile_hash,
 	if (!preq)
 		die("couldn't create http pack request");
 	preq->slot->results = &results;
+	if (packfile_download_only)
+		preq->preserve_tmp_packfile = 1;
 	if (!packfile_to_stdout) {
 		preq->index_pack_args = index_pack_args;
 		preq->preserve_index_pack_stdout = 1;
@@ -113,6 +116,7 @@ int cmd_main(int argc, const char **argv)
 	int get_verbosely = 0;
 	int get_recover = 0;
 	int packfile = 0;
+	int packfile_download_only = 0;
 	int packfile_to_stdout = 0;
 	int nongit;
 	struct object_id packfile_hash;
@@ -136,6 +140,8 @@ int cmd_main(int argc, const char **argv)
 			usage(http_fetch_usage);
 		} else if (!strcmp(argv[arg], "--recover")) {
 			get_recover = 1;
+		} else if (!strcmp(argv[arg], "--download-only")) {
+			packfile_download_only = 1;
 		} else if (!strcmp(argv[arg], "--stdout")) {
 			packfile_to_stdout = 1;
 		} else if (!strcmp(argv[arg], "--stdin")) {
@@ -166,19 +172,28 @@ int cmd_main(int argc, const char **argv)
 	repo_config(the_repository, git_default_config, NULL);
 
 	if (packfile) {
+		if (packfile_download_only && packfile_to_stdout)
+			die(_("the options '%s' and '%s' cannot be used together"),
+			    "--download-only", "--stdout");
+		if (packfile_download_only && index_pack_args.nr)
+			die(_("the option '%s' cannot be used with '%s'"),
+			    "--download-only", "--index-pack-args");
 		if (packfile_to_stdout && index_pack_args.nr)
 			die(_("the option '%s' cannot be used with '%s'"),
 			    "--stdout", "--index-pack-args");
-		if (!packfile_to_stdout && !index_pack_args.nr)
+		if (!packfile_download_only && !packfile_to_stdout && !index_pack_args.nr)
 			die(_("the option '%s' requires '%s'"), "--packfile", "--index-pack-args");
 
 		fetch_single_packfile(&packfile_hash, argv[arg],
 				      index_pack_args.v,
+				      packfile_download_only,
 				      packfile_to_stdout);
 		ret = 0;
 		goto out;
 	}
 
+	if (packfile_download_only)
+		die(_("the option '%s' requires '%s'"), "--download-only", "--packfile");
 	if (packfile_to_stdout)
 		die(_("the option '%s' requires '%s'"), "--stdout", "--packfile");
 	if (index_pack_args.nr)
