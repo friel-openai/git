@@ -1731,6 +1731,9 @@ struct packfile_uri_progress {
 	uintmax_t nr_objects;
 	uintmax_t nr_deltas;
 	uint64_t start_ns;
+	uint64_t first_index_ns;
+	uint64_t all_downloaded_ns;
+	uint64_t all_indexed_ns;
 	size_t last_len;
 	int enabled;
 };
@@ -1757,9 +1760,12 @@ static void display_packfile_uri_progress(struct packfile_uri_progress *progress
 {
 	struct strbuf sb = STRBUF_INIT;
 	struct strbuf bytes = STRBUF_INIT;
-	struct strbuf rate = STRBUF_INIT;
-	uint64_t elapsed_ns;
-	uint64_t rate_bytes = 0;
+	struct strbuf download_rate = STRBUF_INIT;
+	uint64_t now_ns = getnanotime();
+	uint64_t download_elapsed_ns;
+	uint64_t index_elapsed_ns = 0;
+	uint64_t download_rate_bytes = 0;
+	uint64_t index_rate_objects = 0;
 	size_t line_len;
 
 	if (!progress->enabled)
@@ -1767,23 +1773,34 @@ static void display_packfile_uri_progress(struct packfile_uri_progress *progress
 	if (!done && !packfile_uri_stderr_is_foreground())
 		return;
 
-	elapsed_ns = getnanotime() - progress->start_ns;
-	if (elapsed_ns)
-		rate_bytes = progress->nr_bytes_downloaded * 1000000000 /
-			elapsed_ns;
+	download_elapsed_ns = (progress->all_downloaded_ns ?
+			       progress->all_downloaded_ns : now_ns) -
+			      progress->start_ns;
+	if (download_elapsed_ns)
+		download_rate_bytes =
+			progress->nr_bytes_downloaded * 1000000000 /
+			download_elapsed_ns;
+	if (progress->first_index_ns) {
+		index_elapsed_ns = (progress->all_indexed_ns ?
+				    progress->all_indexed_ns : now_ns) -
+				   progress->first_index_ns;
+		if (index_elapsed_ns)
+			index_rate_objects = progress->nr_objects * 1000000000 /
+				index_elapsed_ns;
+	}
 
 	strbuf_humanise_bytes(&bytes, progress->nr_bytes_downloaded);
-	strbuf_humanise_bytes(&rate, rate_bytes);
+	strbuf_humanise_bytes(&download_rate, download_rate_bytes);
 	strbuf_addf(&sb,
 		    "packfile URIs: %"PRIuMAX"/%"PRIuMAX" downloaded, "
 		    "%"PRIuMAX"/%"PRIuMAX" indexed, %"PRIuMAX" objects, "
-		    "%"PRIuMAX" deltas, %s | %s/s",
+		    "%"PRIuMAX" deltas, %s | %s/s download, %"PRIu64" objects/s index",
 		    (uintmax_t)progress->nr_packs_downloaded,
 		    (uintmax_t)progress->nr_packs_total,
 		    (uintmax_t)progress->nr_packs_indexed,
 		    (uintmax_t)progress->nr_packs_total,
 		    progress->nr_objects, progress->nr_deltas,
-		    bytes.buf, rate.buf);
+		    bytes.buf, download_rate.buf, index_rate_objects);
 	if (done)
 		strbuf_addstr(&sb, ", done.");
 	line_len = sb.len;
@@ -1793,7 +1810,7 @@ static void display_packfile_uri_progress(struct packfile_uri_progress *progress
 	fputs(sb.buf, stderr);
 	fflush(stderr);
 	progress->last_len = done ? 0 : line_len;
-	strbuf_release(&rate);
+	strbuf_release(&download_rate);
 	strbuf_release(&bytes);
 	strbuf_release(&sb);
 }
@@ -2050,6 +2067,8 @@ static void fetch_packfile_uris(struct string_list *packfile_uris,
 						 ready[ready_nr - 1].packfile,
 						 index_pack_args,
 						 suppress_progress);
+			if (!progress.first_index_ns)
+				progress.first_index_ns = getnanotime();
 			ready_nr--;
 			nr_indexing++;
 		}
@@ -2092,6 +2111,9 @@ static void fetch_packfile_uris(struct string_list *packfile_uris,
 			ready[ready_nr++] = finish_packfile_uri_download(&downloads[i]);
 			nr_downloading--;
 			progress.nr_packs_downloaded++;
+			if (progress.nr_packs_downloaded == progress.nr_packs_total &&
+			    !progress.all_downloaded_ns)
+				progress.all_downloaded_ns = getnanotime();
 			if (ready[ready_nr - 1].packfile) {
 				struct stat st;
 				if (!stat(ready[ready_nr - 1].packfile, &st))
@@ -2124,6 +2146,9 @@ static void fetch_packfile_uris(struct string_list *packfile_uris,
 						  gitmodules_oids, &progress);
 			nr_indexing--;
 			progress.nr_packs_indexed++;
+			if (progress.nr_packs_indexed == progress.nr_packs_total &&
+			    !progress.all_indexed_ns)
+				progress.all_indexed_ns = getnanotime();
 			display_packfile_uri_progress(&progress, 0);
 		}
 	}
